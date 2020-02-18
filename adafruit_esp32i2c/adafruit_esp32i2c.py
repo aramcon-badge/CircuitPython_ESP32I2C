@@ -1,6 +1,7 @@
 # The MIT License (MIT)
 #
 # Copyright (c) 2019 ladyada for Adafruit Industries
+# Copyright (c) 2020 Uri Shaked
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -20,10 +21,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 """
-`adafruit_esp32spi`
+`adafruit_esp32i2c`
 ================================================================================
 
-CircuitPython driver library for using ESP32 as WiFi  co-processor using SPI
+CircuitPython driver library for using ESP32 as WiFi  co-processor using I2C
 
 
 * Author(s): ladyada
@@ -46,10 +47,10 @@ import struct
 import time
 from micropython import const
 from digitalio import Direction
-from adafruit_bus_device.spi_device import SPIDevice
+from adafruit_bus_device.i2c_device import I2CDevice
 
 __version__ = "0.0.0-auto.0"
-__repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_ESP32SPI.git"
+__repo__ = "https://github.com/aramcon-badge/CircuitPython_ESP32I2C.git"
 
 # pylint: disable=bad-whitespace
 _SET_NET_CMD           = const(0x10)
@@ -140,7 +141,7 @@ ADC_ATTEN_DB_6   = const(2)
 ADC_ATTEN_DB_11  = const(3)
 # pylint: enable=bad-whitespace
 
-class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods, too-many-instance-attributes
+class ESP_I2Ccontrol:  # pylint: disable=too-many-public-methods, too-many-instance-attributes
     """A class that will talk to an ESP32 module programmed with special firmware
     that lets it act as a fast an efficient WiFi co-processor"""
     TCP_MODE = const(0)
@@ -148,7 +149,7 @@ class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods, too-many-insta
     TLS_MODE = const(2)
 
     # pylint: disable=too-many-arguments
-    def __init__(self, spi, cs_pin, ready_pin, reset_pin, gpio0_pin=None, *, debug=False):
+    def __init__(self, i2c, *, debug=False):
         self._debug = debug
         self.set_psk = False
         self.set_crt = False
@@ -157,16 +158,7 @@ class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods, too-many-insta
         self._sendbuf = bytearray(256)  # buffer for command sending
         self._socknum_ll = [[0]]      # pre-made list of list of socket #
 
-        self._spi_device = SPIDevice(spi, cs_pin, baudrate=8000000)
-        self._cs = cs_pin
-        self._ready = ready_pin
-        self._reset = reset_pin
-        self._gpio0 = gpio0_pin
-        self._cs.direction = Direction.OUTPUT
-        self._ready.direction = Direction.INPUT
-        self._reset.direction = Direction.OUTPUT
-        if self._gpio0:
-            self._gpio0.direction = Direction.INPUT
+        self._i2c_device = I2CDevice(i2c, 0x45)
         self.reset()
     # pylint: enable=too-many-arguments
 
@@ -174,16 +166,9 @@ class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods, too-many-insta
         """Hard reset the ESP32 using the reset pin"""
         if self._debug:
             print("Reset ESP32")
-        if self._gpio0:
-            self._gpio0.direction = Direction.OUTPUT
-            self._gpio0.value = True  # not bootload mode
-        self._cs.value = True
-        self._reset.value = False
-        time.sleep(0.01)    # reset
-        self._reset.value = True
-        time.sleep(0.75)    # wait for it to boot up
-        if self._gpio0:
-            self._gpio0.direction = Direction.INPUT
+        # we send 33 zeros, to clear any pending/partially sent command
+        with self._i2c_device as i2c:
+            i2c.write(bytearray(33))  # pylint: disable=no-member
 
     def _wait_for_ready(self):
         """Wait until the ready pin goes low"""
@@ -191,8 +176,9 @@ class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods, too-many-insta
             print("Wait for ESP32 ready", end='')
         times = time.monotonic()
         while (time.monotonic() - times) < 10:  # wait up to 10 seconds
-            if not self._ready.value: # we're ready!
-                break
+            with self._i2c_device as i2c:
+                if self._read_byte(i2c) == 0: # we're ready!
+                    break
             if self._debug >= 3:
                 print('.', end='')
                 time.sleep(0.05)
@@ -238,48 +224,45 @@ class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods, too-many-insta
             ptr += len(param)
         self._sendbuf[ptr] = _END_CMD
 
-        self._wait_for_ready()
-        with self._spi_device as spi:
-            times = time.monotonic()
-            while (time.monotonic() - times) < 1: # wait up to 1000ms
-                if self._ready.value:  # ok ready to send!
-                    break
-            else:
-                raise RuntimeError("ESP32 timed out on SPI select")
-            spi.write(self._sendbuf, start=0, end=packet_len)  # pylint: disable=no-member
+        #self._wait_for_ready()
+        with self._i2c_device as i2c:
+            for i in range(0, packet_len, 32):
+                chunk = self._sendbuf[i : min(packet_len, i + 32)]
+                i2c.write(bytearray([len(chunk)]) + chunk)  # pylint: disable=no-member
+            i2c.write(bytearray(1)) # send a zero to end the packet
             if self._debug >= 3:
                 print("Wrote: ", [hex(b) for b in self._sendbuf[0:packet_len]])
     # pylint: disable=too-many-branches
 
-    def _read_byte(self, spi):
-        """Read one byte from SPI"""
-        spi.readinto(self._pbuf)
+    def _read_byte(self, i2c):
+        """Read one byte from I2C"""
+        i2c.readinto(self._pbuf)
         if self._debug >= 3:
             print("\t\tRead:", hex(self._pbuf[0]))
         return self._pbuf[0]
 
-    def _read_bytes(self, spi, buffer, start=0, end=None):
-        """Read many bytes from SPI"""
+    def _read_bytes(self, i2c, buffer, start=0, end=None):
+        """Read many bytes from I2C"""
         if not end:
             end = len(buffer)
-        spi.readinto(buffer, start=start, end=end)
+        i2c.readinto(buffer, start=start, end=end)
         if self._debug >= 3:
             print("\t\tRead:", [hex(i) for i in buffer])
 
-    def _wait_spi_char(self, spi, desired):
+    def _wait_i2c_char(self, i2c, desired):
         """Read a byte with a time-out, and if we get it, check that its what we expect"""
         times = time.monotonic()
         while (time.monotonic() - times) < 0.1:
-            r = self._read_byte(spi)
+            r = self._read_byte(i2c)
             if r == _ERR_CMD:
                 raise RuntimeError("Error response to command")
             if r == desired:
                 return True
-        raise RuntimeError("Timed out waiting for SPI char")
+        raise RuntimeError("Timed out waiting for I2C char")
 
-    def _check_data(self, spi, desired):
+    def _check_data(self, i2c, desired):
         """Read a byte and verify its the value we want"""
-        r = self._read_byte(spi)
+        r = self._read_byte(i2c)
         if r != desired:
             raise RuntimeError("Expected %02X but got %02X" % (desired, r))
 
@@ -288,31 +271,24 @@ class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods, too-many-insta
         self._wait_for_ready()
 
         responses = []
-        with self._spi_device as spi:
-            times = time.monotonic()
-            while (time.monotonic() - times) < 1: # wait up to 1000ms
-                if self._ready.value:  # ok ready to send!
-                    break
-            else:
-                raise RuntimeError("ESP32 timed out on SPI select")
-
-            self._wait_spi_char(spi, _START_CMD)
-            self._check_data(spi, cmd | _REPLY_FLAG)
+        with self._i2c_device as i2c:
+            self._wait_i2c_char(i2c, _START_CMD)
+            self._check_data(i2c, cmd | _REPLY_FLAG)
             if num_responses is not None:
-                self._check_data(spi, num_responses)
+                self._check_data(i2c, num_responses)
             else:
-                num_responses = self._read_byte(spi)
+                num_responses = self._read_byte(i2c)
             for num in range(num_responses):
-                param_len = self._read_byte(spi)
+                param_len = self._read_byte(i2c)
                 if param_len_16:
                     param_len <<= 8
-                    param_len |= self._read_byte(spi)
+                    param_len |= self._read_byte(i2c)
                 if self._debug >= 2:
                     print("\tParameter #%d length is %d" % (num, param_len))
                 response = bytearray(param_len)
-                self._read_bytes(spi, response)
+                self._read_bytes(i2c, response)
                 responses.append(response)
-            self._check_data(spi, _END_CMD)
+            self._check_data(i2c, _END_CMD)
 
         if self._debug >= 2:
             print("Read %d: " % len(responses[0]), responses)
@@ -321,7 +297,7 @@ class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods, too-many-insta
     def _send_command_get_response(self, cmd, params=None, *,
                                    reply_params=1, sent_param_len_16=False,
                                    recv_param_len_16=False):
-        """Send a high level SPI command, wait and return the response"""
+        """Send a high level I2C command, wait and return the response"""
         self._send_command(cmd, params, param_len_16=sent_param_len_16)
         return self._wait_response_cmd(cmd, reply_params, param_len_16=recv_param_len_16)
 
